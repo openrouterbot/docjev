@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 import os
-import time
-from dataclasses import dataclass, field
-from email.utils import parsedate_to_datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from ..errors import ProviderError
 from ..schemas import RequestRecord
@@ -22,27 +21,49 @@ ATTRIBUTION_HEADERS = {
     "X-OpenRouter-Title": "DocJev",
 }
 
+Unit = Annotated[float, Field(ge=0, le=1)]
+Count = Annotated[int, Field(ge=0)]
 
-@dataclass(frozen=True)
-class ChoiceAnswer:
+
+class Wire(BaseModel):
+    """Strict, so malformed values are rejected rather than coerced."""
+
+    model_config = ConfigDict(strict=True, allow_inf_nan=False, frozen=True)
+
+
+class ChoiceAnswer(Wire):
+    type: Literal["choice"]
     choice: str
-    probabilities: dict[str, float] = field(default_factory=dict)
-    confidence: float | None = None
+    probabilities: dict[str, Unit] = Field(default_factory=dict)
+    confidence: Unit | None = None
+
+    @field_validator("probabilities", mode="before")
+    @classmethod
+    def absent_probabilities(cls, value: Any) -> Any:
+        return {} if value is None else value
 
 
-@dataclass(frozen=True)
-class NoulAnswer:
-    noul: float
+class NoulAnswer(Wire):
+    type: Literal["noul"]
+    noul: Unit
 
 
-@dataclass(frozen=True)
-class DecisionsResponse:
-    id: str | None
+class Usage(Wire):
+    input_tokens: Count | None = None
+    output_tokens: Count | None = None
+    cost: Annotated[float, Field(ge=0)] | None = None
+
+
+class DecisionsResponse(Wire):
+    id: str | None = None
     model: str
-    input_tokens: int | None
-    output_tokens: int | None
-    cost_usd: float | None
-    answers: dict[str, ChoiceAnswer | NoulAnswer]
+    answers: dict[str, Annotated[ChoiceAnswer | NoulAnswer, Field(discriminator="type")]]
+    usage: Usage = Field(default_factory=Usage)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def absent_usage(cls, value: Any) -> Any:
+        return {} if value is None else value
 
     @property
     def choices(self) -> dict[str, ChoiceAnswer]:
@@ -72,103 +93,23 @@ class MalformedDecisionsResponse(Exception):
         self.request_id = request_id
 
 
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _unit(value: Any) -> float:
-    if not _is_number(value) or not 0 <= value <= 1:
-        raise ValueError
-    return float(value)
-
-
-def _optional_count(value: Any) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError
-    return value
-
-
-def _optional_cost(value: Any) -> float | None:
-    if value is None:
-        return None
-    if not _is_number(value) or value < 0:
-        raise ValueError
-    return float(value)
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is not None and not isinstance(value, str):
-        raise ValueError
-    return value
-
-
-def _parse_answer(answer: Any) -> ChoiceAnswer | NoulAnswer:
-    if not isinstance(answer, dict):
-        raise ValueError
-    if answer.get("type") == "choice":
-        choice = answer.get("choice")
-        probabilities = answer.get("probabilities") or {}
-        if not isinstance(choice, str) or not isinstance(probabilities, dict):
-            raise ValueError
-        confidence = answer.get("confidence")
-        return ChoiceAnswer(
-            choice=choice,
-            probabilities={_str(k): _unit(v) for k, v in probabilities.items()},
-            confidence=None if confidence is None else _unit(confidence),
-        )
-    if answer.get("type") == "noul":
-        return NoulAnswer(noul=_unit(answer.get("noul")))
-    raise ValueError
-
-
-def _str(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError
-    return value
-
-
 def parse_decisions(payload: Any) -> DecisionsResponse:
-    """Validate every field downstream records rely on; reject rather than coerce."""
-    request_id = payload.get("id") if isinstance(payload, dict) else None
     try:
-        if not isinstance(payload, dict) or not isinstance(payload.get("answers"), dict):
-            raise ValueError
-        usage = payload.get("usage") or {}
-        if not isinstance(usage, dict):
-            raise ValueError
-        return DecisionsResponse(
-            id=_optional_str(payload.get("id")),
-            model=_str(payload.get("model")),
-            input_tokens=_optional_count(usage.get("input_tokens")),
-            output_tokens=_optional_count(usage.get("output_tokens")),
-            cost_usd=_optional_cost(usage.get("cost")),
-            answers={_str(k): _parse_answer(v) for k, v in payload["answers"].items()},
-        )
-    except ValueError:
+        return DecisionsResponse.model_validate(payload)
+    except ValidationError:
+        request_id = payload.get("id") if isinstance(payload, dict) else None
         raise MalformedDecisionsResponse(
             request_id if isinstance(request_id, str) else None
         ) from None
 
 
-def retry_after_ms(value: str | None, *, now: float | None = None) -> float:
-    """Parse delay-seconds or an HTTP-date; unusable values fall back to normal backoff."""
-    if not value:
-        return 0
+def retry_after_ms(value: str | None) -> float:
+    """Parse Retry-After seconds; unusable values fall back to normal backoff."""
     try:
-        seconds = float(value)
+        seconds = float(value or 0)
     except ValueError:
-        try:
-            moment = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
-            return 0
-        if moment.tzinfo is None:
-            return 0
-        seconds = moment.timestamp() - (time.time() if now is None else now)
-    if not math.isfinite(seconds):
         return 0
-    return max(seconds, 0) * 1000
+    return max(seconds, 0) * 1000 if math.isfinite(seconds) else 0
 
 
 class OpenRouterJevEngine(JevEngine):
@@ -244,6 +185,7 @@ class OpenRouterJevEngine(JevEngine):
     def _success_record(
         self, response: DecisionsResponse, task: str, attempt: int, elapsed_ms: float
     ) -> RequestRecord:
+        usage = response.usage
         return RequestRecord(
             provider=self.name,
             model=response.model,
@@ -251,8 +193,8 @@ class OpenRouterJevEngine(JevEngine):
             attempt=attempt,
             elapsed_ms=elapsed_ms,
             request_id=response.id,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            cost_usd=response.cost_usd,
-            cost_status="unknown" if response.cost_usd is None else "reported",
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cost_usd=usage.cost,
+            cost_status="unknown" if usage.cost is None else "reported",
         )
