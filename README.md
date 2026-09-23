@@ -155,7 +155,7 @@ PDF bytes are uploaded only when LlamaParse is selected. Normalized page text is
 
 ## Jev through OpenRouter
 
-[OpenRouter](https://openrouter.ai/~typesafe/jev-latest) serves Jev through its [Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request). The `openrouter` engine sends the same page state and questions as the direct engine, with the same windowing, retry, and context-recovery behavior, so an existing OpenRouter key and billing account can be used in place of a TypeSafe key. OpenRouter's documented transient statuses (524 edge timeout, 529 provider overloaded) are also retried, and oversized input is recognized from either a 413 or a `max_tokens_exceeded` rejection.
+[OpenRouter](https://openrouter.ai/~typesafe/jev-latest) serves Jev through its [Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request). The `openrouter` engine sends the same page state and questions as the direct engine, with the same windowing, retry, and context-recovery behavior.
 
 ```sh
 uv sync --extra openrouter
