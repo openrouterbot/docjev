@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
+from typesafe_sdk import Answer, ChoiceAnswer, NoulAnswer
+from typesafe_sdk import Usage as SDKUsage
 
 from ..errors import ProviderError
 from ..schemas import RequestRecord
@@ -21,49 +23,26 @@ ATTRIBUTION_HEADERS = {
     "X-OpenRouter-Title": "DocJev",
 }
 
-Unit = Annotated[float, Field(ge=0, le=1)]
-Count = Annotated[int, Field(ge=0)]
+
+def _empty_if_null(value: Any) -> Any:
+    return {} if value is None else value
 
 
-class Wire(BaseModel):
-    """Strict, so malformed values are rejected rather than coerced."""
+class Usage(SDKUsage):
+    model_config = ConfigDict(allow_inf_nan=False)
 
-    model_config = ConfigDict(strict=True, allow_inf_nan=False, frozen=True)
-
-
-class ChoiceAnswer(Wire):
-    type: Literal["choice"]
-    choice: str
-    probabilities: dict[str, Unit] = Field(default_factory=dict)
-    confidence: Unit | None = None
-
-    @field_validator("probabilities", mode="before")
-    @classmethod
-    def absent_probabilities(cls, value: Any) -> Any:
-        return {} if value is None else value
-
-
-class NoulAnswer(Wire):
-    type: Literal["noul"]
-    noul: Unit
-
-
-class Usage(Wire):
-    input_tokens: Count | None = None
-    output_tokens: Count | None = None
     cost: Annotated[float, Field(ge=0)] | None = None
 
 
-class DecisionsResponse(Wire):
+class DecisionsResponse(BaseModel):
+    """Reuses the SDK's answer types so both Jev engines hand JevEngine identical answers."""
+
+    model_config = ConfigDict(strict=True)
+
     id: str | None = None
     model: str
-    answers: dict[str, Annotated[ChoiceAnswer | NoulAnswer, Field(discriminator="type")]]
-    usage: Usage = Field(default_factory=Usage)
-
-    @field_validator("usage", mode="before")
-    @classmethod
-    def absent_usage(cls, value: Any) -> Any:
-        return {} if value is None else value
+    answers: dict[str, Answer]
+    usage: Annotated[Usage, BeforeValidator(_empty_if_null)] = Field(default_factory=Usage)
 
     @property
     def choices(self) -> dict[str, ChoiceAnswer]:
@@ -82,7 +61,6 @@ class DecisionsRequestError(Exception):
         self.status = status
         self.body = body
         self.retry_after_ms = retry_after_ms
-        self.request_id = None
 
 
 class MalformedDecisionsResponse(Exception):

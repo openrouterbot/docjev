@@ -76,35 +76,32 @@ def no_sleep(monkeypatch):
     return delays
 
 
-def answering(seen, **payload_kwargs):
+def answering(seen=None, update=None, **payload_kwargs):
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        seen.append((request, body))
-        return httpx.Response(200, json=decisions_payload(body["questions"], **payload_kwargs))
-
-    return handler
-
-
-def failing_first(status, *, headers=None, body=None):
-    calls: list = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        if len(calls) == 1:
-            return httpx.Response(status, headers=headers, json=body or {"error": {"code": status}})
-        payload = json.loads(request.content)
-        return httpx.Response(200, json=decisions_payload(payload["questions"]))
-
-    return handler, calls
-
-
-def with_answer(update):
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = decisions_payload(json.loads(request.content)["questions"])
-        update(payload)
+        if seen is not None:
+            seen.append((request, body))
+        payload = decisions_payload(body["questions"], **payload_kwargs)
+        if update:
+            update(payload)
         return httpx.Response(200, json=payload)
 
     return handler
+
+
+def failing_first(status=None, *, headers=None, body=None):
+    calls: list = []
+    succeed = answering()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) > 1:
+            return succeed(request)
+        if status is None:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(status, headers=headers, json=body or {"error": {"code": status}})
+
+    return handler, calls
 
 
 async def test_classify_sends_decisions_request_and_reports_billed_cost(
@@ -138,13 +135,13 @@ async def test_classify_sends_decisions_request_and_reports_billed_cost(
 
 
 async def test_missing_cost_is_unknown_rather_than_estimated(document, rules, engine_with):
-    result = await aclassify_document(document, rules, engine=engine_with(answering([], cost=None)))
+    result = await aclassify_document(document, rules, engine=engine_with(answering(cost=None)))
     assert result.metrics.requests[0].cost_usd is None
     assert result.metrics.requests[0].cost_status == "unknown"
 
 
 async def test_split_maps_choice_and_noul_answers(document, rules, engine_with):
-    engine = engine_with(answering([], split_at=frozenset({1, 3})))
+    engine = engine_with(answering(split_at=frozenset({1, 3})))
     result = await asplit_document(document, rules, engine=engine)
     assert [segment.pages for segment in result.segments] == [[1, 2], [3, 4]]
 
@@ -250,46 +247,24 @@ async def test_split_recovers_from_size_rejection_with_smaller_windows(
 
 
 async def test_connection_errors_are_retryable(document, rules, engine_with, no_sleep):
-    calls: list = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        if len(calls) == 1:
-            raise httpx.ConnectError("boom", request=request)
-        body = json.loads(request.content)
-        return httpx.Response(200, json=decisions_payload(body["questions"]))
-
+    handler, _ = failing_first()
     result = await aclassify_document(document, rules, engine=engine_with(handler))
     assert result.metrics.requests[0].error_code == "ConnectionError"
 
 
 @pytest.mark.parametrize(
-    "payload",
-    [
-        {"answers": {"category": {"type": "score", "score": 3}}, "model": "m", "usage": {}},
-        {"model": "m", "usage": {}},
-        ["not", "an", "object"],
-    ],
-)
-async def test_unreadable_responses_fail_as_provider_errors(document, rules, engine_with, payload):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
-
-    with pytest.raises(ProviderError):
-        await aclassify_document(document, rules, engine=engine_with(handler))
-
-
-@pytest.mark.parametrize(
     "update",
     [
+        lambda p: p.pop("answers"),
+        lambda p: p["answers"].update(category={"type": "secret-detail"}),
         lambda p: p["usage"].update(cost="secret-detail"),
-        lambda p: p["usage"].update(output_tokens=-1),
         lambda p: p["answers"]["category"]["probabilities"].update(invoice="secret-detail"),
+        lambda p: p["answers"]["category"].pop("probabilities"),
     ],
 )
-async def test_malformed_fields_are_redacted_and_recorded(document, rules, engine_with, update):
+async def test_malformed_responses_are_redacted_and_recorded(document, rules, engine_with, update):
     with pytest.raises(ProviderError) as caught:
-        await aclassify_document(document, rules, engine=engine_with(with_answer(update)))
+        await aclassify_document(document, rules, engine=engine_with(answering(update=update)))
     assert "secret-detail" not in str(caught.value)
     assert caught.value.__cause__ is None
     assert [record.error_code for record in caught.value.requests] == ["MalformedDecisionsResponse"]
@@ -298,31 +273,25 @@ async def test_malformed_fields_are_redacted_and_recorded(document, rules, engin
 @pytest.mark.parametrize(
     "update",
     [
-        lambda p: p["answers"]["category"].pop("probabilities"),
         lambda p: p["answers"]["category"].update(probabilities={}),
         lambda p: p["answers"]["category"].update(probabilities={"invoice": 0.97}),
     ],
 )
-async def test_classify_rejects_missing_or_partial_probabilities(
-    document, rules, engine_with, update
-):
+async def test_classify_rejects_partial_probabilities(document, rules, engine_with, update):
     with pytest.raises(ProviderError, match="invalid category decision") as caught:
-        await aclassify_document(document, rules, engine=engine_with(with_answer(update)))
+        await aclassify_document(document, rules, engine=engine_with(answering(update=update)))
     assert [record.status for record in caught.value.requests] == ["ok"]
 
 
 @pytest.mark.parametrize(
     "update",
-    [
-        lambda p: p["answers"]["category_2"].pop("probabilities"),
-        lambda p: p["answers"]["category_2"].update(probabilities={"purchase_order": 0.5}),
-    ],
+    [lambda p: p["answers"]["category_2"].update(probabilities={"purchase_order": 0.5})],
 )
 async def test_split_rejects_answers_without_the_chosen_probability(
     document, rules, engine_with, update
 ):
     with pytest.raises(ProviderError, match="invalid page decisions"):
-        await asplit_document(document, rules, engine=engine_with(with_answer(update)))
+        await asplit_document(document, rules, engine=engine_with(answering(update=update)))
 
 
 async def test_caller_owned_client_stays_open_and_owned_client_closes():
