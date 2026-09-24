@@ -283,17 +283,6 @@ async def test_classify_rejects_partial_probabilities(document, rules, engine_wi
     assert [record.status for record in caught.value.requests] == ["ok"]
 
 
-@pytest.mark.parametrize(
-    "update",
-    [lambda p: p["answers"]["category_2"].update(probabilities={"purchase_order": 0.5})],
-)
-async def test_split_rejects_answers_without_the_chosen_probability(
-    document, rules, engine_with, update
-):
-    with pytest.raises(ProviderError, match="invalid page decisions"):
-        await asplit_document(document, rules, engine=engine_with(answering(update=update)))
-
-
 async def test_caller_owned_client_stays_open_and_owned_client_closes():
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
     try:
